@@ -1,0 +1,40 @@
+# scaffold
+
+[![CI](https://github.com/Jartan-LLC/scaffold/actions/workflows/ci.yml/badge.svg)](https://github.com/Jartan-LLC/scaffold/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Jartan-LLC/scaffold/badge)](https://scorecard.dev/viewer/?uri=github.com/Jartan-LLC/scaffold)
+[![License](https://img.shields.io/badge/license-MIT-blue)](https://github.com/Jartan-LLC/scaffold/blob/main/LICENSE)
+[![Open in Dev Containers](https://img.shields.io/static/v1?label=Dev%20Containers&message=Open&color=blue)](https://vscode.dev/redirect?url=vscode://ms-vscode-remote.remote-containers/cloneInVolume?url=https://github.com/Jartan-LLC/scaffold)
+[![Sponsor](https://img.shields.io/static/v1?label=GitHub%20Sponsors&message=Sponsor&logo=githubsponsors&color=ea4aaa)](https://github.com/sponsors/Jartan-LLC)
+
+A production-grade Python repo, already wired: dev container, quality gate, hardened CI,
+releases and auto-updates, green on the first push.
+
+Python-first, with Node/JS supported second. For another stack, the Python parts delete
+cleanly ([how](docs/onboard.md#not-a-python-project)).
+
+## Quick start
+
+1. [Use this template](https://github.com/new?template_name=scaffold&template_owner=Jartan-LLC),
+   then open your new repository in its dev container.
+2. Run `/onboard` in Claude Code. It interviews you, configures the project and lists the
+   manual steps left. To set up by hand instead, follow the
+   [setup checklist](docs/onboard.md).
+3. Run `make check`.
+
+## What you get
+
+| | On day one |
+|---|---|
+| [Dev container](.devcontainer/) | Python, Node/pnpm and the project tools preinstalled; CI rebuilds and checks it whenever it changes, and weekly |
+| [Quality gate](Makefile) | `make check` runs CI's lint, type checks, tests, build and docs locally, plus the advisory dependency audit |
+| [Security-first](.github/workflows/) | Actions pinned to exact commits, a security linter for the workflows themselves, token-free PyPI publishing, and an OpenSSF Scorecard security rating |
+| [CI & releases](.github/workflows/ci.yml) | CI on every pull request; pushing a version tag publishes a GitHub Release with an RPM for Fedora, the PyPI package and multi-arch container images |
+| [Auto-updates](.github/dependabot.yml) | Dependabot updates after a 7-day cooldown, minor and patch ones merged automatically; weekly broken-link and vulnerability checks that open, update and close their own issue |
+| [AI-ready](AGENTS.md) | Claude Code and other coding agents working under tiered project rules, and optional [Liza](docs/scaffold.md#liza) multi-agent runs |
+
+Not for you if you want a minimal template: this one is deliberately complete.
+
+Every file: [What's included](docs/onboard.md#whats-included). How the parts work, and how a
+project pulls in later template improvements: [docs/scaffold.md](docs/scaffold.md).
+
+Scaffold is [MIT-licensed](LICENSE); your project picks its own license during setup.

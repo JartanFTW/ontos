@@ -1,0 +1,8 @@
+# Link patterns lychee skips (regex). Read by the pre-commit hook and external-link-check.yml.
+
+# TODO(/onboard): delete this comment and the line under it: replacing ORG/REPO here
+# would make lychee skip the project's own links. Until then, ORG/REPO links 404.
+https://github.com/ORG/REPO
+
+# The advisory form answers a link check with 404 on a private repository.
+^https://github\.com/[^/]+/[^/]+/security/advisories/new$

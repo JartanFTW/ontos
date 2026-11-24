@@ -1,0 +1,207 @@
+# Releasing
+
+How to cut a release from `main`. The workflows a tag runs are listed in
+[Publishing](docs/scaffold.md#publishing).
+
+## Cut a release
+
+1. Choose the version, written `X.Y.Z` below, a pre-release suffix included. Write a
+   pre-release as `1.2.0-rc.1`. [Pre-releases](#pre-releases) says what one publishes.
+2. On a branch from `main`, move the entries under `## [Unreleased]` in `CHANGELOG.md` to a new
+   section below it, headed `## [X.Y.Z] - YYYY-MM-DD`. That section becomes the release notes;
+   an entry may wrap across lines, since the notes join them. Then replace the `[Unreleased]`
+   link, which before the first release points at `commits/main`, and add a link for the new
+   version. Keep all link definitions at the end of the file, below every section and after a
+   blank line, since one written straight after an entry becomes part of that entry's text:
+
+   <!-- TODO(/onboard): replace ORG/REPO in the links below with the GitHub org and repo. -->
+
+   ```markdown
+   [Unreleased]: https://github.com/ORG/REPO/compare/vX.Y.Z...HEAD
+   [X.Y.Z]: https://github.com/ORG/REPO/releases/tag/vX.Y.Z
+   ```
+
+3. On the same branch, set `version = "X.Y.Z"` in `pyproject.toml`, written exactly as the tag
+   writes it. The built package takes its version from there. `publish-pypi.yml` fails without
+   publishing when that version differs from the tag, `1.2.0rc1` against `v1.2.0-rc.1`
+   included, while the other workflows the tag starts publish regardless.
+   <!-- TODO(/onboard): if the project isn't Python, name the file that holds its version, or delete this step. -->
+4. Open a pull request from that branch and merge it once its checks pass.
+5. Wait for CI to pass on the commit the merge made on `main`. A `v*` tag publishes without
+   waiting for CI, so tag only a commit whose CI run passed:
+
+   ```bash
+   sha=$(gh pr view <PR number> --json mergeCommit --jq .mergeCommit.oid)
+   gh run list --workflow ci.yml --commit "$sha"
+   gh run watch <run ID> --exit-status   # exits non-zero if the run failed
+   ```
+
+   `gh run list` prints nothing until GitHub has created the run; run it again until the run
+   appears. If the run fails, fix `main` through another pull request and repeat this step
+   with that one.
+6. Tag that commit and push the tag:
+
+   ```bash
+   git fetch origin   # so the merge commit exists locally
+   sha=$(gh pr view <PR number> --json mergeCommit --jq .mergeCommit.oid)   # again, in case the CI step's shell is gone
+   git tag vX.Y.Z "$sha"
+   git push origin vX.Y.Z
+   ```
+
+   The tag is `v` and the version exactly as the changelog heading writes it: the release and
+   publish workflows run on `v*` tags, and `release.yml` takes the notes from `## [X.Y.Z]`.
+   Check the tag name and `$sha` before pushing: a pushed tag can be removed only until
+   something publishes from it ([Removing a wrong tag](#removing-a-wrong-tag)). Where the `v*`
+   tag rulesets exist, only an admin can push a `v*` tag, and nobody can move or delete a
+   pushed one without first disabling a ruleset.
+
+## After the tag
+
+The tag starts `release.yml`, `publish-pypi.yml` and `publish-docker.yml`. While
+`packaging/rpm.spec` exists, a failed RPM build or attestation leaves the tag without a GitHub
+Release; if the failure was transient, such as a mirror timeout, `gh run rerun <run ID> --failed`
+on the `release.yml` run creates it. While `packaging/dnf.repo` exists, a failed or rejected
+`sign` job also leaves the tag without a GitHub Release: after a rejection, the same re-run asks
+for approval again and, once approved, creates it, and [Signing key](docs/signing-key.md) says
+what to fix first when the job failed. A `release.yml` run cancelled while it uploaded the
+release's files leaves only a draft release; `gh run rerun <run ID>` on that run deletes the draft
+and creates the release.
+
+1. Approve the `publish-pypi.yml` and `publish-docker.yml` runs: open each from
+   `gh run list --branch vX.Y.Z` and choose Review deployments. A run waits for this only when
+   its environment (`pypi`, `ghcr`) has required reviewers. While `packaging/dnf.repo` exists,
+   approve the `release.yml` run's `sign` job the same way, in the `rpm-signing` environment,
+   earlier tags first, and reject a `sign` job you won't approve, or cancel its run: a tag's
+   `release.yml` run waits until the previous tag's run finishes, so until then later tags get
+   no GitHub Release.
+2. Check that every run succeeded:
+
+   ```bash
+   gh run list --branch vX.Y.Z
+   ```
+
+3. Check the notes with `gh release view vX.Y.Z`. If the `release.yml` run warns that it used
+   generated notes, `CHANGELOG.md` had nothing under `## [X.Y.Z]` at the tag; the warning says
+   why. While `packaging/rpm.spec` exists, check that it lists `NAME.noarch.rpm` too, where
+   `NAME` is `Name` in `packaging/rpm.spec`. While `packaging/dnf.repo` exists, a full release
+   lists `NAME-dnf-repo.tar.gz` as well, the dnf repository's signed metadata.
+4. While `packaging/dnf.repo` exists, check that the `pages.yml` run the release started
+   succeeded: its `verify` job installs the package from the release URL and fails unless the
+   live dnf repository lists the Latest release as the newest version. A full release becomes
+   Latest only when no full release has a higher version. Of the runs this lists, check the
+   one that started when this tag's `release.yml` run finished. If that run was cancelled, a
+   later run took its place in the queue: check that one, which deploys the release that was
+   Latest when it ran. A failed docs build stops the run before it deploys `rpm/`: once a fix
+   to the docs reaches `main`, that push deploys both.
+
+   ```bash
+   gh run list --workflow pages.yml --limit 5
+   ```
+
+## Removing a wrong tag
+
+Remove a tag only while nothing has published from it: a version PyPI took can't be published
+again. First cancel each of the tag's runs that hasn't completed, then check what the runs did:
+
+```bash
+gh run list --branch vX.Y.Z
+gh run cancel <run ID>       # each run not yet completed
+gh run view <run ID> -v      # each run: lists the steps of its jobs
+gh release view vX.Y.Z --json isDraft --jq .isDraft
+```
+
+Nothing has published while `gh release view` prints `release not found` or `true` and
+neither the `publish-pypi.yml` run nor the `publish-docker.yml` run started its upload step,
+`pypa/gh-action-pypi-publish` or `docker/build-push-action`. A run cancelled while it waited
+for approval started neither. A `true` is a draft release left by a `release.yml` run
+cancelled while it uploaded the release's files. Delete it first with
+`gh release delete vX.Y.Z --yes`, which leaves the tag: deleting the tag would leave the draft
+behind.
+
+Where the `v*` tag rulesets exist, an admin then removes the tag by disabling the
+`v* tag updates and deletions` ruleset, deleting the tag, then enabling the ruleset again.
+Without them, the `DELETE` and `git tag -d` lines alone remove it. Each `PUT` prints the
+ruleset's new state:
+
+```bash
+id=$(gh api repos/{owner}/{repo}/rulesets --jq '.[] | select(.name == "v* tag updates and deletions") | .id')
+gh api -X PUT "repos/{owner}/{repo}/rulesets/$id" -f enforcement=disabled --jq .enforcement
+gh api -X DELETE repos/{owner}/{repo}/git/refs/tags/vX.Y.Z
+gh api -X PUT "repos/{owner}/{repo}/rulesets/$id" -f enforcement=active --jq .enforcement
+git tag -d vX.Y.Z
+```
+
+Run the last `PUT` even if the `DELETE` fails. It must print `active`; until it does, anyone
+with write access can move or delete any `v*` tag.
+
+## A published version is bad
+
+Once anything has published from a tag, fix forward instead of removing the tag:
+
+1. Fix or revert the change on a branch from `main`, and release it as the next patch version,
+   as [Cut a release](#cut-a-release) says. Its tag publishes everywhere the bad version's
+   did, and replaces it as the newest version.
+2. Leave the bad version's tag, and what it published, in place. A moved tag would serve
+   different content under a version already published, and a registry may refuse the same
+   version twice.
+3. If nobody should install the bad version, withdraw it where its registry allows (on PyPI,
+   yank it), and name the fixed version in its release notes.
+
+## Pre-releases
+
+For a tag with a pre-release version, such as `v1.2.0-rc.1`:
+
+- `release.yml` creates a GitHub pre-release, which GitHub never marks Latest;
+- `publish-pypi.yml` publishes a PyPI pre-release, with the version normalized (`1.2.0rc1`);
+- while `packaging/rpm.spec` exists, the RPM's version is `1.2.0~rc.1`, which `dnf` upgrades in
+  place to `1.2.0`;
+- while `packaging/dnf.repo` exists, the RPM is signed, but stays out of the dnf repository,
+  which would otherwise upgrade every user to it;
+- `publish-docker.yml` tags the image `1.2.0-rc.1` only, leaving `1.2` and `latest` where they
+  were.
+
+## Installing the RPM
+
+<!-- TODO(/onboard): in the commands below, replace ORG/REPO with the GitHub org and repo, and NAME with Name in packaging/rpm.spec. -->
+
+Users install the RPM, and later upgrade it in place, with:
+
+```bash
+sudo dnf install https://github.com/ORG/REPO/releases/latest/download/NAME.noarch.rpm
+```
+
+`dnf` checks no signature on a package installed from a URL, so it prints `Warning: skipped
+OpenPGP checks for 1 package`. In a public repository, to check that a release built it,
+download it and verify its attestation before installing it:
+
+```bash
+gh release download --repo ORG/REPO --pattern NAME.noarch.rpm
+gh attestation verify NAME.noarch.rpm --repo ORG/REPO
+sudo dnf install ./NAME.noarch.rpm
+```
+
+### Updates through dnf
+
+The package adds the project's dnf repository, so `sudo dnf upgrade` installs each new release.
+The repository works with dnf on Fedora and on EL 8, 9 and 10.
+
+<!-- TODO(/onboard): replace FINGERPRINT below with the signing key's fingerprint once you make it, as step 4 of docs/signing-key.md's Making a key says. -->
+
+The key that signs the packages and the repository has the fingerprint `FINGERPRINT`;
+`gpg --show-keys /etc/pki/rpm-gpg/RPM-GPG-KEY-NAME` prints the fingerprints of the keys the
+package installed.
+
+If dnf prints `>>> repomd.xml GPG signature verification error`, it skipped the repository:
+
+- once, right after a release: dnf read the new files and the old signature; run the command
+  again;
+- every time: the project's signing key changed, and this machine missed the releases that
+  brought the new one; install the package again from the URL above.
+
+A machine that updates with no one at a terminal, such as through `dnf-automatic`, can't answer
+dnf's prompt to trust the key. After installing the package:
+
+- Fedora 45 and later: nothing to do;
+- older Fedora: run
+  `sudo rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-NAME && sudo dnf -y makecache` once;
+- EL: run `sudo rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-NAME` once.

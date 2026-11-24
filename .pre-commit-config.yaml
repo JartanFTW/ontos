@@ -1,0 +1,74 @@
+# The single source of truth for file-level linting — run by `make lint` and CI
+# (`pre-commit run --all-files`) as well as on commit (after `pre-commit install`).
+# Its revs are the only ruff and codespell versions; `make fix` runs the ruff hooks.
+# Checks that need the project's environment live in the Makefile.
+#
+# Revs are pinned to commit SHAs (# frozen: vX.Y.Z); Dependabot's pre-commit entry bumps
+# them. Bump all by hand with: pre-commit autoupdate --freeze, then set the
+# lychee-docker entry tag to match.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: ef6cf06c079dd6b299dfc720b0f14400c9d168e1 # frozen: v0.17.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/codespell-project/codespell
+    rev: 57b21406f092110c18776e39b0bda50d37c945c8 # frozen: v2.4.3
+    hooks:
+      - id: codespell
+        additional_dependencies: [tomli] # read [tool.codespell] from pyproject
+        # A key's base64 hits the word list by chance.
+        exclude: ^packaging/RPM-GPG-KEY$
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: 745eface02aef23e168a8afb6b5737818efbea95 # frozen: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        args: [--external-sources] # follow `# shellcheck source=` into sourced helpers
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: c01a1853c19b175aee6a09f24e2ad9b748c485ad # frozen: v0.24.1
+    hooks:
+      - id: markdownlint-cli2
+  - repo: https://github.com/lycheeverse/lychee
+    rev: 2bba271688c1abb1503097a064e6c3bc1d1b6a9b # frozen: lychee-v0.24.2
+    hooks:
+      # Offline: relative links only. External-link rot is non-deterministic, so it's
+      # caught by external-link-check.yml, not this blocking gate.
+      - id: lychee-docker # docker: no Rust toolchain needed locally
+        # The hook's manifest hardcodes its image tag, which can lag the rev, so set it
+        # here; the lychee-image-tag hook below fails unless it matches the rev.
+        entry: lycheeverse/lychee:0.24.2
+        args: [--offline, --no-progress] # args replace the default, so restate --no-progress
+        types: [markdown]
+  - repo: https://github.com/rhysd/actionlint
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca # frozen: v1.7.12
+    hooks:
+      - id: actionlint-docker # docker: no Go toolchain needed locally
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: 06a39750ec31860bb44f2acf67182c40016cd1e7 # frozen: v1.32.0
+    hooks:
+      - id: zizmor
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # frozen: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+      - id: check-merge-conflict
+        # Without the flag it checks nothing outside a live merge, as in CI. With it,
+        # any line that starts like a conflict marker fails, including a setext
+        # underline of exactly seven "=".
+        args: [--assume-in-merge]
+  - repo: local
+    hooks:
+      # Rev bumps leave the lychee-docker entry behind. Remove this hook with that entry
+      # once upstream's manifest names the rev's tag.
+      - id: lychee-image-tag
+        name: lychee-docker image tag matches the lychee rev
+        language: pygrep
+        entry: 'frozen: lychee-v(\S+)$.*?^ *entry: lycheeverse/lychee:\1$'
+        args: [--multiline, --negate] # also fails if the entry line is gone
+        files: ^\.pre-commit-config\.yaml$

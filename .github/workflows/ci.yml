@@ -1,0 +1,358 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  # Dev extras, hook envs and the dev container build's downloads resolve at run time,
+  # so `main` can go red with no commit touching it; these catch that before the next
+  # PR does. A push that the `changes` job gates out of a job leaves that job's check
+  # to the weekly run.
+  push:
+    branches: [main]
+  schedule:
+    - cron: "10 7 * * 1" # weekly, Monday 07:10 UTC (offset from the other weekly runs)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_SYSTEM_PYTHON: 1
+
+# A PR's new push cancels its old run; main's runs never cancel each other, so each
+# finishes its dev container image-cache export.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
+
+      # `version-file` is required: without it this action installs uv `latest`,
+      # not the ci/requirements.txt pin.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: ci/requirements.txt
+          enable-cache: true
+
+      # All file linters live in .pre-commit-config.yaml (the single source, shared
+      # with `make lint`). pre-commit builds its own hook envs, so this job installs
+      # no project extras.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: pre-commit-
+      - run: uv pip install -r ci/requirements.txt
+      - run: pre-commit run --all-files --show-diff-on-failure
+      # The .example name keeps the Pages workflow from actionlint and zizmor.
+      - name: Lint pages.yml.example as pages.yml
+        run: |
+          if [ -f .github/workflows/pages.yml.example ]; then
+            cp .github/workflows/pages.yml.example .github/workflows/pages.yml
+            pre-commit run actionlint-docker --files .github/workflows/pages.yml
+            pre-commit run zizmor --files .github/workflows/pages.yml
+          fi
+
+      # Node/JS (secondary) — uncomment after adding package.json + committing a lockfile.
+      # Drop `version:` if package.json pins pnpm in `packageManager`: the action rejects both.
+      # The key names pnpm's major, which the store path and pnpm/setup's own `cache` key omit.
+      # - uses: pnpm/setup@fbda4c85fc2e1e08721cd8763afea8f48d60f024 # v3.0.0
+      #   with:
+      #     version: 12
+      #     runtime: node@22
+      #     install: false
+      # - id: pnpm-store
+      #   run: |
+      #     {
+      #       echo "path=$(pnpm store path)"
+      #       echo "major=$(pnpm --version | cut -d. -f1)"
+      #     } >> "$GITHUB_OUTPUT"
+      # - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      #   with:
+      #     path: ${{ steps.pnpm-store.outputs.path }}
+      #     key: pnpm-store-${{ runner.os }}-${{ steps.pnpm-store.outputs.major }}-${{ hashFiles('pnpm-lock.yaml') }}
+      #     restore-keys: pnpm-store-${{ runner.os }}-${{ steps.pnpm-store.outputs.major }}-
+      # - run: pnpm install --frozen-lockfile
+      # - run: pnpm exec prettier --check .
+
+  # pyright, the package build and the audit share one job and one install: each job is
+  # billed as at least a minute, and on their own these finish well inside one.
+  python:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: ci/requirements.txt
+          enable-cache: true
+
+      # The full environment `make check` audits: package deps plus the dev/docs/CI
+      # tools, not just the declared deps.
+      - id: install
+        run: uv pip install -e '.[dev,docs]' -r ci/requirements.txt
+      - run: pyright
+
+      # These run whatever pyright found, so one run reports every failing check.
+      # `uv build` builds the project in its own isolated env. It builds as publish-pypi.yml
+      # does, so a ci/build-requirements.txt that no longer covers the build backend fails
+      # here rather than at the tag.
+      - id: build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: uv build --build-constraints ci/build-requirements.txt --require-hashes
+      - if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python -m twine check dist/*
+
+      # Advisory: an unfixable transitive advisory must not fail every run.
+      # dependency-audit.yml tracks findings in an issue. The job stays green either
+      # way, so the step adds a warning naming pip-audit to flag a failure on the PR.
+      - name: Audit dependencies for known CVEs
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          pip-audit || {
+            echo "::warning title=pip-audit::pip-audit failed: a known vulnerability or an audit error. See this step's log."
+            exit 1
+          }
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: ci/requirements.txt
+          enable-cache: true
+          # One cache per interpreter: the matrix legs resolve different wheels.
+          cache-suffix: py${{ matrix.python-version }}
+
+      - run: uv pip install -e '.[dev]'
+      - run: pytest -m "not integration"
+
+  docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: ci/requirements.txt
+          enable-cache: true
+
+      # Installs as the Pages docs job does, to check the build it publishes:
+      # docs/conf.py puts src/ on the path, so the package isn't built and, while
+      # `dependencies` is static, no unpinned build backend runs; --exclude-newer keeps
+      # out releases under a week old.
+      - run: uv pip install --exclude-newer "7 days" -r pyproject.toml --extra docs
+      - run: sphinx-build -W -b html docs docs/_build/html
+
+  # Integration tests against a docker-compose stack, with coverage uploaded as an
+  # artifact. Uncomment once you add a docker-compose.test.yml (service `app`) and a
+  # Dockerfile test target, and add `pytest-cov` to the dev extras. Then add
+  # `integration-tests` to the `check` job's needs + results below.
+  # integration-tests:
+  #   runs-on: ubuntu-24.04
+  #   timeout-minutes: 20
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  #       with:
+  #         persist-credentials: false
+  #     - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+  #     - name: Start stack
+  #       run: docker compose -f docker-compose.test.yml up -d --build --wait
+  #     - name: Integration tests + coverage
+  #       run: docker compose -f docker-compose.test.yml exec -T app python -m pytest -m integration --cov=app --cov-report=xml:/app/coverage.xml
+  #     - name: Extract coverage
+  #       if: always()
+  #       run: docker compose -f docker-compose.test.yml cp app:/app/coverage.xml ./coverage.xml
+  #     - name: Upload coverage
+  #       if: always()
+  #       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+  #       with:
+  #         name: coverage-report
+  #         path: coverage.xml
+  #         if-no-files-found: warn
+  #     - name: Tear down
+  #       if: always()
+  #       run: docker compose -f docker-compose.test.yml down -v
+
+  # The image publish-docker.yml pushes, built from this commit for the runner's platform
+  # only, so a change that breaks the build fails here rather than at the tag.
+  docker:
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t app:ci .
+      # Smoke test: uncomment once the Dockerfile has a start command. Swap `--help` for a
+      # /health curl if it's a server.
+      # - run: docker run --rm app:ci --help
+
+  # The RPM a release attaches, built from this commit with its %check, then installed.
+  rpm:
+    needs: changes
+    if: needs.changes.outputs.rpm == 'true'
+    permissions:
+      contents: read
+    # actionlint rejects the $/ form zizmor asks for (rhysd/actionlint#711).
+    uses: ./.github/workflows/rpm.yml # zizmor: ignore[self-repository]
+    with:
+      version: 0.0.0-ci
+
+  # The signed dnf repository packaging/dnf-repo.sh builds, for RPMs that install its .repo
+  # file and key: built in one Fedora container, then served from the runner and installed
+  # from in a second, fresh one.
+  dnf-repo:
+    needs: changes
+    if: needs.changes.outputs.dnf_repo == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rpm.yml's image job, which runs whenever this job does, fails unless the FROM line
+      # pins a digest.
+      - name: Pull the Fedora image
+        run: |
+          FEDORA=$(docker build -q - <packaging/fedora.Containerfile)
+          echo "FEDORA=$FEDORA" >>"$GITHUB_ENV"
+
+      - name: Build the repository
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$FEDORA" bash -c \
+            'dnf -y install git-core rpm-build createrepo_c rpm-sign gnupg2 zstd && ci/dnf-repo-test.sh build www'
+
+      # auto_import_local_keys needs dnf5 5.4.7 or later; the upgrade can go once the image
+      # has it. The port is the one ci/dnf-repo-test.sh's url names.
+      - name: Install from the repository
+        run: |
+          python3 ci/dnf_repo_server.py www 8000 &
+          docker run --rm --network host -v "$PWD:/src" -w /src "$FEDORA" bash -c \
+            'dnf -y upgrade dnf5 && dnf -y install dnf5-plugin-automatic && ci/dnf-repo-test.sh check www'
+
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      devcontainer: ${{ steps.diff.outputs.devcontainer }}
+      docker: ${{ steps.diff.outputs.docker }}
+      python: ${{ steps.diff.outputs.python }}
+      rpm: ${{ steps.packaging.outputs.rpm }}
+      dnf_repo: ${{ steps.packaging.outputs.dnf_repo }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # A push diffs against the previous tip, which a credential-less fetch can't
+          # reach in a private repo, so push runs check out the whole history. '0' is
+          # quoted because a bare 0 is falsy and would give push runs depth 2.
+          fetch-depth: ${{ github.event_name == 'push' && '0' || '2' }}
+      # The rpm job runs on every change while the project ships an RPM, and the dnf-repo
+      # job while that RPM carries a dnf repository too: they depend on the tree, not the
+      # diff, so they stay out of ci/changes.py.
+      - id: packaging
+        run: |
+          if [ -f packaging/rpm.spec ]; then
+            echo "rpm=true" >>"$GITHUB_OUTPUT"
+            if [ -f packaging/dnf.repo ]; then
+              echo "dnf_repo=true" >>"$GITHUB_OUTPUT"
+            fi
+          fi
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: python3 ci/changes.py "$EVENT" "$BEFORE" >>"$GITHUB_OUTPUT"
+
+  devcontainer:
+    name: Dev container
+    needs: changes
+    if: needs.changes.outputs.devcontainer == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # The gha cache backend reads these; devcontainers/ci doesn't pass them to buildx.
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            for (const name of ["ACTIONS_RUNTIME_TOKEN", "ACTIONS_RESULTS_URL", "ACTIONS_CACHE_URL", "ACTIONS_CACHE_SERVICE_V2"]) {
+              if (process.env[name]) core.exportVariable(name, process.env[name]);
+            }
+      - uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          push: never
+          cacheFrom: type=gha,scope=devcontainer
+          cacheTo: type=gha,mode=max,scope=devcontainer
+          runCmd: bash .devcontainer/verify.sh
+
+  check:
+    if: always()
+    # When you uncomment integration-tests above, add it to BOTH the needs list and
+    # the results array below.
+    needs: [lint, python, test, docs, docker, rpm, dnf-repo, changes, devcontainer]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: |
+          results=("${{ needs.lint.result }}" "${{ needs.python.result }}" "${{ needs.test.result }}" "${{ needs.docs.result }}" "${{ needs.docker.result }}" "${{ needs.rpm.result }}" "${{ needs.dnf-repo.result }}" "${{ needs.changes.result }}" "${{ needs.devcontainer.result }}")
+          for r in "${results[@]}"; do
+            if [[ "$r" != "success" && "$r" != "skipped" ]]; then
+              echo "Check failed: $r"
+              exit 1
+            fi
+          done
